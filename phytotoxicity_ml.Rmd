@@ -1,0 +1,333 @@
+---
+title: "phytotoxicity-ML"
+author: "Andrew"
+date: "2023-09-22"
+output: html_document
+---
+
+```{r}
+library(xlsx) # Load the xlsx library for reading, writing and editing Excel files
+library(tidyverse) # Load the tidyverse library, a collection of R packages designed for data science
+library(dplyr) # Load the dplyr library for data manipulation
+library(rcdk) # Load the rcdk library for chemoinformatics
+library(pROC) # Load the pROC library for visualizing and analyzing ROC curves
+library(randomForest) # Load the randomForest library for creating random forest models
+library(e1071) # Load the e1071 library for machine learning algorithms
+library(ggsci) # Load the ggsci library for scientific journal and sci-fi themed color palettes
+library(gbm) # Load the gbm library for generalized boosted regression models
+library(neuralnet) # Load the neuralnet library for training and visualizing neural networks
+library(ellipse) # Load the ellipse library for drawing ellipses and ellipse-like confidence regions
+library(GGally) # Load the GGally library for creating matrix scatterplots
+library(patchwork) # Load the patchwork library for combining multiple ggplots
+library(pheatmap) # Load the pheatmap library for pretty heatmaps
+library(ggannotate) # Load the ggannotate library for interactive ggplot annotation
+library(gghalves) # Load the gghalves library for creating half-half geoms in ggplot2
+library(showtext) # Load the showtext library for using fonts more easily in R graphs
+library(caret) # Load the caret library for classification and regression training
+library(cowplot) # Load the cowplot library, which provides various features that help with creating publication-quality figures with ggplot2
+library(rfPermute) # Load the rfPermute library for estimating permutation p-values for random forest importance metrics
+library(fmsb) # Load the fmsb library, which contains some useful functions from a methodological point of view in model-based series of bioassay experiments 
+library(ICEbox) # Load the ICEbox library for creating ICE (Individual Conditional Expectation) plots to visualize prediction functions 
+library(iml) # Load the iml library which provides tools for interpreting machine learning models 
+TNM <- 'sans' # Set TNM to 'sans', which is a type of font family in R 
+
+TNM <- 'sans'
+```
+
+## Data import
+
+```{r}
+file_path <- 'C:/Users/36461/Desktop/paper1/Meta-Machine learning-20221201.xlsx'
+
+pesticde <- read.xlsx(file_path,1)[,1:7]
+pesticde$group <- 1
+pesticde$pop <- 'Pesticide'
+
+ppcp <- read.xlsx(file_path,2)[,1:7]
+ppcp$group <- 2
+ppcp$pop <- 'PPCPs'
+
+pahs <- read.xlsx(file_path,3)[,1:7]
+pahs$group <- 3
+pahs$pop <- 'PAHs'
+
+pcbs <- read.xlsx(file_path,4)[,1:7]
+pcbs$group <- 4
+pcbs$pop <- 'HOPs'
+
+other <- read.xlsx(file_path,5)[,1:7]
+other$group <- 5
+other$pop <- 'Others'
+
+paes <- read.xlsx(file_path,6)[,1:7]
+paes$group <- 6
+paes$pop <- 'PAEs'
+
+refer <- read.xlsx(file_path,8)
+
+total <- rbind(pesticde,ppcp,pahs,pcbs,other,paes)
+total$pollutant <- toupper(total$pollutant)
+refer$Name <- toupper(refer$Name)
+total_refer <- merge(total,refer,by.x = 'pollutant',by.y='Name')
+total%>% distinct(pollutant)
+
+clean_data <- total_refer[,]
+```
+
+## Data cleaning and pretreatment
+
+```{r pressure, echo=FALSE}
+clean_data_subset <- clean_data 
+rcdk_data <- clean_data_subset
+rcdk_data$value <- as.numeric(rcdk_data$value)
+rcdk_data_2 <- rcdk_data %>%
+  dplyr::group_by(conc,refer,CID,time,MW,LogKow,group) %>%
+  summarise(as=mean(value))
+rcdk_data_3 <- left_join(rcdk_data,rcdk_data_2)
+rcdk_data_3 <- rcdk_data_3[,-6]
+rcdk_data_4 <- unique(rcdk_data_3)
+add_four_col_conc <- function(rcdk_data) {
+  rcdk_data_conc_x <- rcdk_data %>%
+    dplyr::group_by(refer) %>%
+    summarise(conc_mean=mean(conc),conc_sd=sd(conc),conc_max=(max(conc)+1)) 
+  rcdk_data_conc_x <- left_join(rcdk_data,rcdk_data_conc_x,by='refer')
+  rcdk_data_conc_x  <- rcdk_data_conc_x  %>%
+    mutate(conc_x=conc/conc_max)
+  rcdk_data_conc_x
+}
+
+rcdk_data_conc_x <- add_four_col_conc(rcdk_data_4)
+```
+
+## Function of CMD
+
+```{r}
+smile <- data.frame(clean_data[, 'SMILES']) %>% distinct()
+colnames(smile) <- 'SMILES'
+smile <- na.omit(smile)
+t_mol <- data.frame()
+dc <- get.desc.categories()
+
+for (i in 1:length(smile$SMILES)) {
+  mol <- parse.smiles(smile[i, 1])
+  dn <- get.desc.names(dc[3])
+  allDescs_3 <- eval.desc(mol, dn)
+  dn <- get.desc.names(dc[4])
+  allDescs_4 <- eval.desc(mol, dn)
+  all_D <- cbind(allDescs_3, allDescs_4)
+  t_mol <- rbind(t_mol, all_D)
+}
+
+delete_all_zero_cols <- function(df) {
+  all_zero_cols <- which(colSums(df == 0) == nrow(df))
+  return(df[, -all_zero_cols])
+}
+
+remove_na_cols <- function(df) {
+  complete_cols <- which(colSums(is.na(df)) == 0)
+  return(df[, complete_cols])
+}
+
+t_mol2 <- remove_na_cols(delete_all_zero_cols(t_mol))
+t_mol3 <- t_mol2[, c(2, 3, 5:8, 10, 11, 12, 15, 24:35, 42, 43)]
+t_mol3$SMILES <- rownames(t_mol3)
+clean_data_subset_tmol <- left_join(clean_data_subset[, c(1:7, 1:12,14,15,17:19)], t_mol3)
+test3 <- which(is.na(clean_data_subset_tmol)) 
+```
+
+## Functiong of MACCS
+
+```{r}
+smile_to_maccs <- function(u) {
+
+  comp_smile <- u %>% distinct(SMILES)
+  SMILES <- na.omit(comp_smile)$SMILES
+  iter_num <- length(SMILES)
+
+  mols <- parse.smiles(SMILES[1])
+  fp <- get.fingerprint(mols[[1]], type = 'maccs')
+  num <- fp@bits
+  dt <- data.frame(mol = 'fpt', fp = 1:166)
+  dt$fp = 0 
+  dt$mol <- paste0(dt$mol, 1:166)
+  dt[num, 'fp'] <- 1
+  rownames(dt) <- dt$mol
+  dt$mol <- NULL
+  names(dt)[1] <- paste0('molecule', 1)
+
+  for (i in 2:iter_num) {
+    mols <- parse.smiles(SMILES[i])
+    fp <- get.fingerprint(mols[[1]], type = 'maccs')
+    num <- fp@bits
+    dta <- data.frame(mol = 'fpt', fp = 1:166)
+    dta$fp = 0 
+    dta$mol <- paste0(dta$mol, 1:166)
+    dta[num, 'fp'] <- 1
+    rownames(dta) <- dta$mol
+    dta$mol <- NULL
+    names(dta)[1] <- paste0('molecule', i)
+    dt <- cbind(dt, dta)
+  }
+  
+  colnames(dt) <- SMILES
+  dt_t <- data.frame(t(dt))
+  dt_t$SMILES <- rownames(dt_t)
+  
+  return(dt_t)
+}
+```
+
+## CMD model
+
+```{r}
+add_four_col_conc <- function(rcdk_data) {
+  rcdk_data_conc_x <- rcdk_data %>%
+    group_by(refer) %>%
+    summarise(conc_mean = mean(conc), conc_sd = sd(conc), conc_max = (max(conc) + 1))
+  rcdk_data_conc_x <- left_join(rcdk_data, rcdk_data_conc_x, by = 'refer')
+  rcdk_data_conc_x <- rcdk_data_conc_x %>%
+    mutate(conc_x = conc / conc_max)
+  return(rcdk_data_conc_x)
+}
+
+clean_r0 <- clean_data_subset_tmol #%>% filter(index == 'mor')
+rcdk_data <- clean_r0
+rcdk_data$value <- as.numeric(rcdk_data$value)
+
+rcdk_data_2 <- rcdk_data %>%
+  group_by(conc, refer, pollutant, time) %>%
+  summarise(as = mean(value))
+rcdk_data_3 <- left_join(rcdk_data, rcdk_data_2)
+rcdk_data_4 <- unique(rcdk_data_3)
+
+rcdk_data_conc_x <- add_four_col_conc(rcdk_data_4)
+clean_r <- rcdk_data_conc_x[, -c(1, 6:19,25,27,28, 34,50:52)]
+clean_r[clean_r == 'root'] <- 1
+clean_r[clean_r == 'shoot'] <- 2
+clean_r$part <- as.numeric(clean_r$part)
+clean_r[clean_r == 'mor'] <- 1
+clean_r[clean_r == 'pho'] <- 2
+clean_r[clean_r == 'anti'] <- 3
+clean_r$index <- as.numeric(clean_r$index)
+clean_r <- clean_r %>% distinct()
+
+```
+
+## MACCS model
+```{r}
+dt_t <- smile_to_maccs(smile)
+dt_t$SMILES <- smile$SMILES
+
+clean_data_with_fp <- left_join(clean_data_subset, dt_t)
+clean_data_with_fp_conc_x <- add_four_col_conc(clean_data_with_fp)
+clean_data_with_fp_conc_x$value <- as.numeric(clean_data_with_fp_conc_x$value)
+clean_data_with_fp_conc_x_as <- clean_data_with_fp_conc_x %>%
+  group_by(conc, refer, pollutant, time) %>%
+  summarise(as = mean(value))
+clean_fp_mol <- left_join(clean_data_with_fp_conc_x, clean_data_with_fp_conc_x_as)
+clean_rf <- clean_fp_mol[, -c(1, 4,6:19, 186:188)]
+clean_rf <- na.omit(clean_rf)
+clean_rf$as <- as.numeric(clean_rf$as)
+clean_rf[clean_rf == 'root'] <- 1
+clean_rf[clean_rf == 'shoot'] <- 2
+clean_rf$part <- as.numeric(clean_rf$part)
+clean_rf <- delete_all_zero_cols(clean_rf)
+clean_f <- clean_rf %>%
+  distinct()
+clean_r <- clean_f
+clean_r[clean_r == 'mor'] <- 1
+clean_r[clean_r == 'pho'] <- 2
+clean_r[clean_r == 'anti'] <- 3
+clean_r$index <- as.numeric(clean_r$index)
+clean_r <-clean_r %>%
+  distinct()
+clean_r <- clean_r %>%
+  filter(index==3)
+```
+
+## Cross validation
+
+```{r}
+sub <- sample(1:length(clean_r[, 1]), 0.8 * length(clean_r[, 1]))
+train <- clean_r[sub, ]
+test <- clean_r[-sub, ]
+
+# random forest #
+ctrl <- trainControl(method = "cv", number = 5)
+tune_grid <- expand.grid(mtry = c(10:50))
+rf_re2 <- data.frame()
+for (i in seq(100,1200,by=100)) {
+  tune_rf <- train(as ~ ., data = train, method = "rf",
+                 preProcess = c("center", "scale"), 
+                 ntree =i, tuneGrid =tune_grid, trControl = ctrl)
+  rf_re2 <- rbind(rf_re2,tune_rf$results)
+}
+rf_re2$ntree <- rep(seq(from = 100, to = 1200, by = 100), each = 41)
+
+# ANN #
+trControl <- trainControl(method = "cv", number = 5)
+grid <- expand.grid(layer1 = 1:5, layer2 = c(0, 1:5),layer3 = c(0,1:5))
+tune_net <- train(as ~ ., data = train, method = "neuralnet", 
+               trControl = trControl, tuneGrid = grid,
+               preProcess = c("center", "scale"),
+               algorithm = "backprop", linear.output = FALSE,
+               stepmax = 1e6,learningrate=0.1)
+
+tune_net$bestTune 
+
+# gbm #
+trControl <- trainControl(method = "cv", number = 5)
+grid <- expand.grid(n.trees = seq(100, 1000, by = 100),
+                    interaction.depth = c(1, 2, 3),
+                    shrinkage = c(0.01, 0.1),
+                    n.minobsinnode = c(10, 20))
+tune_gbm <- train(as ~ ., data = train, method = "gbm", 
+               preProcess = c("center", "scale"),trControl = trControl, tuneGrid = grid,
+               verbose = FALSE)
+tune_gbm$bestTune  
+
+# svm #
+grid <- expand.grid(sigma = 2^(-5:0), C = 2^(-5:10))
+tune_svm <- train(as ~ ., data = train, method = "svmRadial", 
+               preProcess = c("center", "scale"),trControl = trControl, tuneGrid = grid)
+tune_svm$bestTune 
+```
+
+## Model assessment
+
+```{r}
+evaluate_regression_model_performance <- function(model, x, y) {
+  predictions <- predict(model, x)
+  perf <- postResample(predictions, y)
+  rmse <- perf["RMSE"]
+  rsq <- perf["Rsquared"]
+  return(list(RMSE = rmse, Rsquared = rsq))
+}
+
+sub <- sample(1:length(clean_r[, 1]), 0.8 * length(clean_r[, 1]))
+train <- clean_r[sub, ]
+test <- clean_r[-sub, ]
+
+wine_randomforest <- randomForest(as ~ ., data = train, ntree =500, mtry = 6, importance = T,localImp = TRUE)
+plot(wine_randomforest)
+varImpPlot(wine_randomforest)
+wine_neuralnet <- neuralnet(as ~ ., train, hidden = c(3,4))
+
+wine_gbm <- gbm(as ~ ., data = train, n.trees = 600, shrinkage = 0.1, n.minobsinnode = 20, interaction.depth = 3)
+
+wine_svm <- svm(as ~ ., data = train,cost=128)
+
+as_col <- 30
+
+rf_r <- evaluate_regression_model_performance(wine_randomforest, test[, -as_col], test[, as_col])
+gbm_r <- evaluate_regression_model_performance(wine_gbm, test[, -as_col], test[, as_col])
+net_r <- evaluate_regression_model_performance(wine_neuralnet, test[, -as_col], test[, as_col])
+svm_r <- evaluate_regression_model_performance(wine_svm, test[, -as_col], test[, as_col])
+
+svm_r
+net_r
+gbm_r
+rf_r
+
+predict(wine_randomforest,)
+```
